@@ -1,0 +1,35 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"  # HTTP API
+      - "6334:6334"  # gRPC API
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - ./qdrant_config:/qdrant/config
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+      - QDRANT__CLUSTER__ENABLED=false # Single node mode
+      - QDRANT__STORAGE__OPTIMIZERS__INDEXING_THRESHOLD=20000
+      - QDRANT__STORAGE__OPTIMIZERS__MEMMAP_THRESHOLD=20000
+    networks:
+      - rag-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  qdrant_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/vector-store  # Mount persistent storage
+
+networks:
+  rag-network:
+    driver: bridge

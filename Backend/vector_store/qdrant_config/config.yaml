@@ -1,0 +1,32 @@
+service:
+  http_port: 6333
+  grpc_port: 6334
+
+storage:
+  # Optimized for read-heavy RAG workload
+  performance:
+    # Size of segment in kilobytes
+    max_segment_size: 300000  # ~300MB
+    # Maximum number of vectors to store in-memory per segment
+    max_search_threads: 4
+    # Keep payload in memory for faster filtering
+    payload_memory_limit: 1000000000  # 1GB
+
+optimizers:
+  # Configuration for index optimizations
+  indexing_threshold: 20000
+  memmap_threshold: 20000
+  vacuum_min_vector_number: 1000
+
+hnsw_config:
+  # HNSW index parameters
+  m: 16
+  ef_construct: 100
+  full_scan_threshold: 10000
+
+quantization:
+  # Enable scalar quantization for memory efficiency
+  scalar:
+    type: int8
+    quantile: 0.95
+    always_ram: true
