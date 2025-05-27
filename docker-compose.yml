@@ -1,35 +1,80 @@
+version: '3.8'
+
 services:
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: qdrant
-    restart: unless-stopped
+  # Ollama LLM provider
+  ollama: 
+    build:
+      context: ./Backend/ollama 
     ports:
-      - "6333:6333"  # HTTP API
-      - "6334:6334"  # gRPC API
+      - "11434:11434"
     volumes:
-      - qdrant_data:/qdrant/storage
-      - ./qdrant_config:/qdrant/config
-    environment:
-      - QDRANT__SERVICE__GRPC_PORT=6334
-      - QDRANT__CLUSTER__ENABLED=false # Single node mode
-      - QDRANT__STORAGE__OPTIMIZERS__INDEXING_THRESHOLD=20000
-      - QDRANT__STORAGE__OPTIMIZERS__MEMMAP_THRESHOLD=20000
-    networks:
-      - rag-network
+      - ollama_data:/root/.ollama
+    restart: always
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      test: ["CMD", "curl", "--fail", "http://localhost:11434"]
       interval: 30s
       timeout: 10s
       retries: 5
+      start_period: 30s
+
+  # Qdrant Vector Store
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333" # Qdrant HTTP/gRPC API
+      - "6334:6334" # Qdrant metrics/dashboard
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: always
+
+  # RabbitMQ Message Broker
+  rabbitmq: # <--- NEW SERVICE
+    image: rabbitmq:3-management-alpine # Lightweight image with management UI
+    hostname: rabbitmq # Important for internal Docker network resolution
+    ports:
+      - "5672:5672" # AMQP protocol port
+      - "15672:15672" # Management UI port (http://localhost:15672, guest/guest)
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq # Persist RabbitMQ data
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest # Change in production!
+
+  # Orchestrator
+  orchestrator:
+    build:
+      context: ./Backend
+      dockerfile: orchestrator/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - OLLAMA_API_URL=${OLLAMA_API_URL}
+      - QDRANT_API_URL=${QDRANT_API_URL}
+      - RABBITMQ_HOST=rabbitmq # <--- NEW ENV VAR for orchestrator
+    depends_on:
+      - ollama
+      - qdrant
+      - rabbitmq # Orchestrator depends on RabbitMQ
+
+
+
+  # Example Agent: Summarization Agent
+  summarization_agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.summarization_agent
+    environment:
+      - OLLAMA_API_URL=${OLLAMA_API_URL}
+      - RABBITMQ_HOST=rabbitmq # <--- NEW ENV VAR for agent
+      - AGENT_NAME=summarization_agent # Agent needs to know its name for queueing
+    ports:
+      - "8002:8002" # Only needed if you want to expose its API directly, not for orchestrator comms
+    depends_on:
+      - ollama
+      - rabbitmq
 
 volumes:
+  ollama_data:
   qdrant_data:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /mnt/vector-store  # Mount persistent storage
-
-networks:
-  rag-network:
-    driver: bridge
+  rabbitmq_data:

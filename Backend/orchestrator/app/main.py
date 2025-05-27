@@ -6,15 +6,15 @@ import logging
 import httpx
 from typing import Dict, Any, List
 
-from intent_entity import IntentEntityRecognizer
-from config import intent_model_config, entity_patterns_config
+from agents.common.llm_client import LLMClient # Import the LLMClient
 from models.schemas import AgentRegistration, TaskRequest, TaskResponse # Assuming your schema import
-from Backend.agents.common.llm_client import LLMClient # Import the LLMClient
+from app.intent_entity import IntentEntityRecognizer
+from app.config import intent_model_config, entity_patterns_config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-ier = IntentEntityRecognizer(intent_model_config, entity_patterns_config)
+# ier = IntentEntityRecognizer(intent_model_config, entity_patterns_config)
 
 # In-memory storage for registered agents (replace with a more robust solution)
 # In a real app, this might be managed by a database or a service discovery tool
