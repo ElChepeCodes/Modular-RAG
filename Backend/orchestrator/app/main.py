@@ -1,15 +1,29 @@
 # orchestrator/app/main.py
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import OAuth2PasswordBearer
 from contextlib import asynccontextmanager
 import os
 import logging
+import asyncio
+import uuid
 import httpx
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
+# External imports
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
+from sentence_transformers import SentenceTransformer
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+
+# Project imports
 from agents.common.llm_client import LLMClient # Import the LLMClient
 from models.schemas import AgentRegistration, TaskRequest, TaskResponse # Assuming your schema import
+from auth.database import create_db_and_tables, get_db, User
+from auth.auth import get_current_user, get_password_hash, verify_password, create_access_token, get_current_active_user, ACCESS_TOKEN_EXPIRE_MINUTES
 from app.intent_entity import IntentEntityRecognizer
 from app.config import intent_model_config, entity_patterns_config
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 # In-memory storage for registered agents (replace with a more robust solution)
 # In a real app, this might be managed by a database or a service discovery tool
+pending_requests: Dict[str, Dict[str, Any]] = {}
 registered_agents: Dict[str, str] = {}
 
 

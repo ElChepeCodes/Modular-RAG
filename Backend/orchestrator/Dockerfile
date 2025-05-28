@@ -10,6 +10,8 @@ COPY models/ ./models/
 
 COPY agents/common/ ./agents/common/
 
+COPY auth/ ./auth/
+
 COPY orchestrator/app/ ./app/
 
 ENV PYTHONPATH=/app

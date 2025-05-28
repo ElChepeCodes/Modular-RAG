@@ -41,6 +41,18 @@ services:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest # Change in production!
 
+  db:
+    image: postgres:latest
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: user_db
+    volumes: 
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: always
+
   # Orchestrator
   orchestrator:
     build:
@@ -55,7 +67,8 @@ services:
     depends_on:
       - ollama
       - qdrant
-      - rabbitmq # Orchestrator depends on RabbitMQ
+      - rabbitmq
+      - db
 
 
 
@@ -78,3 +91,4 @@ volumes:
   ollama_data:
   qdrant_data:
   rabbitmq_data:
+  postgres_data:
