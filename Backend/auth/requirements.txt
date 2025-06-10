@@ -1,10 +1,27 @@
-fastapi
-uvicorn[standard]
-strawberry-graphql[fastapi]
-bcrypt
-PyJWT
-python-dotenv
-sqlalchemy[asyncio]
-asyncpg
-passlib[bcrypt]
-python-jose[cryptography]
+# FastAPI y servidor
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# Base de datos
+sqlalchemy[asyncio]==2.0.23
+asyncpg==0.29.0
+
+# Autenticación y seguridad
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+bcrypt==4.1.2
+
+# Validación y modelos
+pydantic[email]==2.5.0
+email-validator==2.1.0
+
+# Configuración
+python-dotenv==1.0.0
+
+# Logging con colores
+colorlog==6.8.0
+
+# Desarrollo y testing (opcional)
+pytest==7.4.3
+pytest-asyncio==0.21.1
+httpx==0.25.2

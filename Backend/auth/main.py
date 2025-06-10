@@ -1,242 +1,573 @@
-# Backend/auth_graphql/main.py (Conceptual Rewrite - NOT fully tested code)
-import os
-import json # You'll need this for parsing Cognito JWTs or other configs
-from typing import Optional
-from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.security import OAuth2PasswordBearer
-from dotenv import load_dotenv
-import strawberry
-from strawberry.fastapi import GraphQLRouter
+from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi.middleware.cors import CORSMiddleware as FastAPICORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.security import OAuth2PasswordRequestForm
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy import or_
+import uvicorn
+from typing import List
 
-# AWS SDK
-import boto3
+# Imports locales
+from .env_config import config, initialize_environment
+from .logging_config import setup_logging_from_config, get_logger
+from .database import init_database, close_database, get_db, User
+from .middleware import AuthMiddleware, RateLimitMiddleware, SecurityHeadersMiddleware
+from .auth import (
+    authenticate_user, get_current_user, get_current_active_user, 
+    get_current_verified_user, get_optional_current_user,
+    create_access_token, create_refresh_token, store_refresh_token,
+    verify_refresh_token, revoke_refresh_token, revoke_all_user_refresh_tokens,
+    get_password_hash, update_last_login
+)
+from .schemas import (
+    UserCreate, UserLogin, UserResponse, UserUpdate, UserChangePassword,
+    LoginResponse, RegisterResponse, MessageResponse, ErrorResponse,
+    HealthResponse, RefreshTokenRequest, UsernameCheck, EmailCheck,
+    AvailabilityResponse, UserPublic
+)
 
-# For JWT validation from Cognito
-import jwt
-from jwt.algorithms import RSAAlgorithm
-from urllib.request import urlopen
+# Configurar logging
+logger = setup_logging_from_config()
 
-load_dotenv()
 
-# --- Configuration ---
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1") # Example region
-COGNITO_USER_POOL_ID = os.getenv("COGNITO_USER_POOL_ID", "your-cognito-user-pool-id")
-COGNITO_CLIENT_ID = os.getenv("COGNITO_CLIENT_ID", "your-cognito-client-id") # For User Pool client without a secret
+# ============= Lifecycle Management =============
 
-# For validating Cognito JWTs
-# This URL provides the public keys for your Cognito User Pool
-COGNITO_JWKS_URL = f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
-
-# --- AWS Clients ---
-cognito_client = boto3.client('cognito-idp', region_name=AWS_REGION)
-# dynamodb_client = boto3.client('dynamodb', region_name=AWS_REGION) # If storing user profiles separately
-
-# --- User Model and Authentication Logic (Conceptual) ---
-
-# In Cognito, users are managed by Cognito itself.
-# You might still have a local User class to represent the authenticated user's data for your app.
-class User:
-    def __init__(self, id: str, username: str, email: Optional[str] = None):
-        self.id = id
-        self.username = username
-        self.email = email
-
-# --- GraphQL Types ---
-
-@strawberry.type
-class UserType:
-    id: str
-    username: str
-    email: Optional[str]
-
-@strawberry.type
-class AuthResponse:
-    user: Optional[UserType]
-    access_token: Optional[str] # This will be the Cognito ID or Access token
-    id_token: Optional[str]     # Cognito ID token
-    refresh_token: Optional[str] # Cognito Refresh token
-    message: str
-    success: bool
-
-# --- GraphQL Mutations ---
-
-@strawberry.type
-class Mutation:
-    @strawberry.mutation
-    async def register_user(self, username: str, password: str, email: Optional[str] = None) -> AuthResponse:
-        try:
-            # Cognito Sign Up API call
-            response = cognito_client.sign_up(
-                ClientId=COGNITO_CLIENT_ID,
-                Username=username,
-                Password=password,
-                UserAttributes=[
-                    {'Name': 'email', 'Value': email}
-                ] if email else []
-            )
-            
-            # Note: Cognito often requires email verification (confirmation code) after sign_up
-            # For simplicity, this example assumes no confirmation, or that you'll handle it elsewhere.
-            # In a real app, you'd call 'confirm_sign_up' after user provides code.
-            
-            return AuthResponse(
-                user=None, # User details might not be immediately available before confirmation
-                access_token=None,
-                id_token=None,
-                refresh_token=None,
-                message="User registered. Confirmation may be required.",
-                success=True
-            )
-        except cognito_client.exceptions.UsernameExistsException:
-            return AuthResponse(message="User already exists.", success=False)
-        except Exception as e:
-            print(f"Error registering user: {e}")
-            return AuthResponse(message=f"Registration failed: {e}", success=False)
-
-    @strawberry.mutation
-    async def login_user(self, username: str, password: str) -> AuthResponse:
-        try:
-            # Initiate Auth API call for login
-            response = cognito_client.initiate_auth(
-                ClientId=COGNITO_CLIENT_ID,
-                AuthFlow='USER_PASSWORD_AUTH', # Or 'ADMIN_NO_SRP_AUTH' if using admin credentials
-                AuthParameters={
-                    'USERNAME': username,
-                    'PASSWORD': password
-                }
-            )
-            
-            auth_result = response['AuthenticationResult']
-            id_token = auth_result['IdToken']
-            access_token = auth_result['AccessToken']
-            refresh_token = auth_result.get('RefreshToken')
-
-            # Decode ID token to get user details
-            decoded_id_token = jwt.decode(id_token, options={"verify_signature": False}) # Just to get username/email for response
-            user_id = decoded_id_token.get('sub')
-            user_username = decoded_id_token.get('cognito:username', username) # Use cognito username if available
-            user_email = decoded_id_token.get('email')
-
-            logged_in_user = UserType(id=user_id, username=user_username, email=user_email)
-
-            return AuthResponse(
-                user=logged_in_user,
-                access_token=access_token,
-                id_token=id_token,
-                refresh_token=refresh_token,
-                message="Login successful!",
-                success=True
-            )
-        except cognito_client.exceptions.NotAuthorizedException:
-            return AuthResponse(message="Invalid username or password.", success=False)
-        except cognito_client.exceptions.UserNotConfirmedException:
-             return AuthResponse(message="User not confirmed.", success=False)
-        except Exception as e:
-            print(f"Error logging in user: {e}")
-            return AuthResponse(message=f"Login failed: {e}", success=False)
-
-# --- GraphQL Queries ---
-
-@strawberry.type
-class Query:
-    @strawberry.field
-    async def hello(self) -> str:
-        return "Hello from AWS Cognito GraphQL Auth Service!"
-
-    @strawberry.field
-    async def me(self, info: strawberry.Info) -> Optional[UserType]:
-        current_user = info.context["current_user"]
-        if not current_user:
-            raise HTTPException(status_code=401, detail="Not authenticated")
-        return UserType(id=current_user.id, username=current_user.username, email=current_user.email)
-
-# --- GraphQL Schema ---
-schema = strawberry.Schema(query=Query, mutation=Mutation)
-
-# --- FastAPI App Setup ---
-app = FastAPI()
-graphql_app = GraphQLRouter(schema)
-
-# --- JWT Validation (for protected queries like 'me') ---
-# Cache JWKS public keys for faster validation
-cached_jwks = None
-
-async def get_jwks():
-    global cached_jwks
-    if cached_jwks is None:
-        try:
-            with urlopen(COGNITO_JWKS_URL) as response:
-                jwks = json.loads(response.read().decode('utf-8'))
-                cached_jwks = {jwk['kid']: jwk for jwk in jwks['keys']}
-        except Exception as e:
-            print(f"Error fetching JWKS: {e}")
-            raise HTTPException(status_code=500, detail="Failed to load public keys for token validation.")
-    return cached_jwks
-
-async def verify_cognito_jwt(token: str) -> Optional[dict]:
-    jwks = await get_jwks()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifecycle manager para el servicio de autenticación."""
+    logger.info("🚀 [AUTH-SERVICE] Iniciando servicio de autenticación...")
     
-    # Get kid from token header to find the correct public key
-    unverified_header = jwt.get_unverified_header(token)
-    kid = unverified_header['kid']
-    
-    if kid not in jwks:
-        raise HTTPException(status_code=401, detail="Invalid token: KID not found.")
-
-    public_key = RSAAlgorithm.from_jwk(json.dumps(jwks[kid]))
-
     try:
-        payload = jwt.decode(
-            token,
-            public_key,
-            algorithms=['RS256'], # Cognito JWTs use RS256, not HS256
-            audience=COGNITO_CLIENT_ID # Audience is your Cognito Client ID
-            # issuer=f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}" # Optional, but good for stricter validation
-        )
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired.")
-    except jwt.InvalidTokenError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+        # Inicializar configuración
+        initialize_environment()
+        
+        # Inicializar base de datos
+        await init_database()
+        
+        logger.info("✅ [AUTH-SERVICE] Servicio iniciado exitosamente")
+        yield
+        
     except Exception as e:
-        print(f"Error during JWT validation: {e}")
-        raise HTTPException(status_code=401, detail="Authentication failed.")
-
-
-# Middleware to add current_user to GraphQL context
-@app.middleware("http")
-async def add_user_to_context(request: Request, call_next):
-    current_user = None
-    auth_header = request.headers.get("Authorization")
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.split(" ")[1]
+        logger.error(f"❌ [AUTH-SERVICE] Error iniciando servicio: {e}")
+        raise
+    finally:
+        # Cleanup
+        logger.info("🔄 [AUTH-SERVICE] Cerrando servicio...")
         try:
-            payload = await verify_cognito_jwt(token)
-            # Fetch user details from Cognito or DynamoDB if needed.
-            # For simplicity, extract from JWT payload:
-            user_id = payload.get('sub')
-            username = payload.get('cognito:username') # Often 'cognito:username' or 'username'
-            email = payload.get('email')
-            current_user = User(id=user_id, username=username, email=email)
-        except HTTPException as e:
-            print(f"Authentication failed in middleware: {e.detail}")
+            await close_database()
+            logger.info("✅ [AUTH-SERVICE] Servicio cerrado exitosamente")
         except Exception as e:
-            print(f"Unexpected error in middleware auth: {e}")
+            logger.error(f"❌ [AUTH-SERVICE] Error cerrando servicio: {e}")
 
-    request.state.current_user = current_user
-    response = await call_next(request)
-    return response
 
-# Custom context getter for Strawberry
-async def get_context(request: Request):
+# ============= FastAPI App Creation =============
+
+app = FastAPI(
+    title="Authentication Service",
+    description="Servicio de autenticación con JWT y gestión de usuarios",
+    version="1.0.0",
+    lifespan=lifespan,
+    debug=config.debug_mode
+)
+
+# ============= Middleware Setup =============
+
+# Security headers (debe ir primero)
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Rate limiting
+app.add_middleware(
+    RateLimitMiddleware, 
+    requests_per_minute=config.rate_limit_requests_per_minute
+)
+
+# CORS
+app.add_middleware(
+    FastAPICORSMiddleware,
+    allow_origins=config.allowed_origins,
+    allow_credentials=True,
+    allow_methods=config.allowed_methods,
+    allow_headers=config.allowed_headers,
+)
+
+# Auth middleware (debe ir al final)
+app.add_middleware(AuthMiddleware)
+
+
+# ============= Error Handlers =============
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Manejador personalizado para HTTPException."""
+    logger.warning(f"⚠️ [HTTP_ERROR] {exc.status_code}: {exc.detail}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "detail": exc.detail,
+            "error_code": getattr(exc, 'error_code', None)
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Manejador general para excepciones no controladas."""
+    logger.error(f"❌ [UNHANDLED_ERROR] {type(exc).__name__}: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "detail": "Internal server error",
+            "error_code": "INTERNAL_ERROR"
+        }
+    )
+
+
+# ============= Health Check =============
+
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
+async def health_check(db: AsyncSession = Depends(get_db)):
+    """Health check del servicio."""
+    try:
+        # Verificar conexión a base de datos
+        await db.execute(select(1))
+        db_status = "healthy"
+    except Exception as e:
+        logger.error(f"❌ [HEALTH] Error conectando a base de datos: {e}")
+        db_status = "unhealthy"
+    
+    return HealthResponse(
+        status="healthy" if db_status == "healthy" else "degraded",
+        timestamp=datetime.utcnow(),
+        environment=config.environment,
+        database_status=db_status
+    )
+
+
+@app.get("/", tags=["Root"])
+async def root():
+    """Endpoint raíz del servicio."""
     return {
-        "request": request,
-        "current_user": request.state.current_user
+        "service": "Authentication Service",
+        "version": "1.0.0",
+        "status": "running",
+        "timestamp": datetime.utcnow(),
+        "environment": config.environment
     }
 
-graphql_app.context_getter = get_context
-app.include_router(graphql_app, prefix="/graphql")
 
-@app.get("/")
-async def root():
-    return {"message": "AWS Cognito GraphQL Authentication Service is running!"}
+# ============= Authentication Endpoints =============
+
+@app.post("/auth/register", response_model=RegisterResponse, tags=["Authentication"])
+async def register_user(
+    user_data: UserCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    """Registra un nuevo usuario."""
+    try:
+        logger.info(f"📝 [REGISTER] Intento de registro para usuario: {user_data.username}")
+        
+        # Verificar si el usuario ya existe
+        existing_user = await db.execute(
+            select(User).where(
+                or_(
+                    User.username == user_data.username,
+                    User.email == user_data.email
+                )
+            )
+        )
+        
+        if existing_user.scalars().first():
+            logger.warning(f"⚠️ [REGISTER] Usuario ya existe: {user_data.username}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username or email already registered"
+            )
+        
+        # Crear nuevo usuario
+        hashed_password = get_password_hash(user_data.password)
+        db_user = User(
+            username=user_data.username,
+            email=user_data.email,
+            full_name=user_data.full_name,
+            hashed_password=hashed_password,
+            is_active=True,
+            is_verified=False  # Requiere verificación por email
+        )
+        
+        db.add(db_user)
+        await db.commit()
+        await db.refresh(db_user)
+        
+        logger.info(f"✅ [REGISTER] Usuario registrado exitosamente: {db_user.username}")
+        
+        return RegisterResponse(
+            user=UserResponse.from_orm(db_user),
+            message="User registered successfully. Please verify your email."
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ [REGISTER] Error registrando usuario: {e}")
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error creating user"
+        )
+
+
+@app.post("/auth/login", response_model=LoginResponse, tags=["Authentication"])
+async def login_user(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: AsyncSession = Depends(get_db)
+):
+    """Autentica un usuario y retorna tokens."""
+    try:
+        logger.info(f"🔐 [LOGIN] Intento de login para: {form_data.username}")
+        
+        # Autenticar usuario
+        user = await authenticate_user(db, form_data.username, form_data.password)
+        
+        if not user:
+            logger.warning(f"⚠️ [LOGIN] Credenciales inválidas para: {form_data.username}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # Crear tokens
+        access_token_expires = timedelta(minutes=config.access_token_expire_minutes)
+        access_token = create_access_token(
+            data={"sub": user.username}, 
+            expires_delta=access_token_expires
+        )
+        
+        refresh_token = create_refresh_token()
+        await store_refresh_token(db, user.id, refresh_token)
+        
+        # Actualizar último login
+        await update_last_login(db, user)
+        
+        logger.info(f"✅ [LOGIN] Login exitoso para: {user.username}")
+        
+        return LoginResponse(
+            user=UserResponse.from_orm(user),
+            access_token=access_token,
+            refresh_token=refresh_token,
+            token_type="bearer",
+            expires_in=config.access_token_expire_minutes * 60,
+            message="Login successful"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ [LOGIN] Error en login: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error during login"
+        )
+
+
+@app.post("/auth/refresh", response_model=LoginResponse, tags=["Authentication"])
+async def refresh_token(
+    refresh_data: RefreshTokenRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Renueva un access token usando un refresh token."""
+    try:
+        logger.debug("🔄 [REFRESH] Intentando renovar token")
+        
+        # Verificar refresh token
+        user = await verify_refresh_token(db, refresh_data.refresh_token)
+        
+        if not user:
+            logger.warning("⚠️ [REFRESH] Refresh token inválido")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid refresh token"
+            )
+        
+        # Crear nuevo access token
+        access_token_expires = timedelta(minutes=config.access_token_expire_minutes)
+        access_token = create_access_token(
+            data={"sub": user.username}, 
+            expires_delta=access_token_expires
+        )
+        
+        # Crear nuevo refresh token
+        new_refresh_token = create_refresh_token()
+        
+        # Revocar el refresh token anterior y crear uno nuevo
+        await revoke_refresh_token(db, refresh_data.refresh_token)
+        await store_refresh_token(db, user.id, new_refresh_token)
+        
+        logger.debug(f"✅ [REFRESH] Token renovado para: {user.username}")
+        
+        return LoginResponse(
+            user=UserResponse.from_orm(user),
+            access_token=access_token,
+            refresh_token=new_refresh_token,
+            token_type="bearer",
+            expires_in=config.access_token_expire_minutes * 60,
+            message="Token refreshed successfully"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ [REFRESH] Error renovando token: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error refreshing token"
+        )
+
+
+@app.post("/auth/logout", response_model=MessageResponse, tags=["Authentication"])
+async def logout_user(
+    refresh_data: RefreshTokenRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Logout de usuario revocando el refresh token."""
+    try:
+        logger.info(f"👋 [LOGOUT] Logout para usuario: {current_user.username}")
+        
+        # Revocar el refresh token específico
+        await revoke_refresh_token(db, refresh_data.refresh_token)
+        
+        logger.info(f"✅ [LOGOUT] Logout exitoso para: {current_user.username}")
+        
+        return MessageResponse(
+            message="Logout successful",
+            success=True
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ [LOGOUT] Error en logout: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error during logout"
+        )
+
+
+@app.post("/auth/logout-all", response_model=MessageResponse, tags=["Authentication"])
+async def logout_all_devices(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Logout de todos los dispositivos del usuario."""
+    try:
+        logger.info(f"🚫 [LOGOUT_ALL] Logout total para usuario: {current_user.username}")
+        
+        # Revocar todos los refresh tokens del usuario
+        await revoke_all_user_refresh_tokens(db, current_user.id)
+        
+        logger.info(f"✅ [LOGOUT_ALL] Logout total exitoso para: {current_user.username}")
+        
+        return MessageResponse(
+            message="Logged out from all devices successfully",
+            success=True
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ [LOGOUT_ALL] Error en logout total: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error during logout from all devices"
+        )
+
+
+# ============= User Management Endpoints =============
+
+@app.get("/users/me", response_model=UserResponse, tags=["Users"])
+async def get_current_user_info(current_user: User = Depends(get_current_active_user)):
+    """Obtiene información del usuario actual."""
+    logger.debug(f"👤 [USER_INFO] Información solicitada por: {current_user.username}")
+    return UserResponse.from_orm(current_user)
+
+
+@app.put("/users/me", response_model=UserResponse, tags=["Users"])
+async def update_current_user(
+    user_update: UserUpdate,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Actualiza información del usuario actual."""
+    try:
+        logger.info(f"✏️ [USER_UPDATE] Actualización de usuario: {current_user.username}")
+        
+        # Verificar email único si se está actualizando
+        if user_update.email and user_update.email != current_user.email:
+            existing_email = await db.execute(
+                select(User).where(User.email == user_update.email)
+            )
+            if existing_email.scalars().first():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Email already registered"
+                )
+        
+        # Actualizar campos
+        for field, value in user_update.dict(exclude_unset=True).items():
+            setattr(current_user, field, value)
+        
+        await db.commit()
+        await db.refresh(current_user)
+        
+        logger.info(f"✅ [USER_UPDATE] Usuario actualizado: {current_user.username}")
+        
+        return UserResponse.from_orm(current_user)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ [USER_UPDATE] Error actualizando usuario: {e}")
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error updating user"
+        )
+
+
+@app.post("/users/change-password", response_model=MessageResponse, tags=["Users"])
+async def change_password(
+    password_data: UserChangePassword,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Cambia la contraseña del usuario actual."""
+    try:
+        logger.info(f"🔐 [CHANGE_PASSWORD] Cambio de contraseña para: {current_user.username}")
+        
+        # Verificar contraseña actual
+        from .auth import verify_password
+        if not verify_password(password_data.current_password, current_user.hashed_password):
+            logger.warning(f"⚠️ [CHANGE_PASSWORD] Contraseña actual incorrecta: {current_user.username}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Current password is incorrect"
+            )
+        
+        # Actualizar contraseña
+        current_user.hashed_password = get_password_hash(password_data.new_password)
+        await db.commit()
+        
+        # Revocar todos los refresh tokens por seguridad
+        await revoke_all_user_refresh_tokens(db, int(current_user.id))
+        
+        logger.info(f"✅ [CHANGE_PASSWORD] Contraseña cambiada para: {current_user.username}")
+        
+        return MessageResponse(
+            message="Password changed successfully. Please login again.",
+            success=True
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ [CHANGE_PASSWORD] Error cambiando contraseña: {e}")
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error changing password"
+        )
+
+
+# ============= Utility Endpoints =============
+
+@app.post("/auth/check-username", response_model=AvailabilityResponse, tags=["Utilities"])
+async def check_username_availability(
+    username_data: UsernameCheck,
+    db: AsyncSession = Depends(get_db)
+):
+    """Verifica si un username está disponible."""
+    try:
+        existing_user = await db.execute(
+            select(User).where(User.username == username_data.username)
+        )
+        
+        available = existing_user.scalars().first() is None
+        
+        return AvailabilityResponse(
+            available=available,
+            message="Username is available" if available else "Username is already taken"
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ [CHECK_USERNAME] Error verificando username: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error checking username availability"
+        )
+
+
+@app.post("/auth/check-email", response_model=AvailabilityResponse, tags=["Utilities"])
+async def check_email_availability(
+    email_data: EmailCheck,
+    db: AsyncSession = Depends(get_db)
+):
+    """Verifica si un email está disponible."""
+    try:
+        existing_user = await db.execute(
+            select(User).where(User.email == email_data.email)
+        )
+        
+        available = existing_user.scalars().first() is None
+        
+        return AvailabilityResponse(
+            available=available,
+            message="Email is available" if available else "Email is already registered"
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ [CHECK_EMAIL] Error verificando email: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error checking email availability"
+        )
+
+
+@app.get("/users", response_model=List[UserPublic], tags=["Users"])
+async def list_users(
+    skip: int = 0,
+    limit: int = 100,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Lista usuarios públicos (solo información básica)."""
+    try:
+        logger.debug(f"📋 [LIST_USERS] Lista solicitada por: {current_user.username}")
+        
+        result = await db.execute(
+            select(User)
+            .where(User.is_active == True)
+            .offset(skip)
+            .limit(limit)
+        )
+        users = result.scalars().all()
+        
+        return [UserPublic.from_orm(user) for user in users]
+        
+    except Exception as e:
+        logger.error(f"❌ [LIST_USERS] Error listando usuarios: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error listing users"
+        )
+
+
+# ============= Main Entry Point =============
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host=config.host,
+        port=config.port,
+        reload=config.debug_mode,
+        log_level=config.log_level.lower()
+    )
